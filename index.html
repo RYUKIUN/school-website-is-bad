@@ -1,372 +1,76 @@
-<!DOCTYPE html>
-<html lang="th">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ค้นหาเกียรติบัตร</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<style>
-  body{ font-family: sans-serif; max-width: 700px; margin: 40px auto; padding: 0 16px; }
-  label{ display:block; margin-top: 12px; font-size: 14px; }
-  input{ padding: 8px; font-size: 14px; width: 100%; box-sizing: border-box; }
-  .year-inputs{ display:flex; gap: 8px; }
-  .year-inputs input{ width: 100px; flex: none; }
-  button{ margin-top: 16px; padding: 10px 20px; font-size: 14px; cursor: pointer; }
-  button:disabled{ opacity: .5; cursor: not-allowed; }
-  #progressWrap{ display:none; margin-top: 20px; }
-  progress{ width: 100%; }
-  #liveMatches{ font-size: 13px; color: #555; margin-top: 8px; }
-  table{ width: 100%; border-collapse: collapse; margin-top: 20px; }
-  th, td{ text-align: left; padding: 6px 8px; border-bottom: 1px solid #ddd; font-size: 14px; }
-  #resultsWrap{ display:none; }
-  #downloadAllBtn{ margin-bottom: 10px; }
-</style>
-</head>
-<body>
+// Cloudflare Worker: HTTPS -> HTTP CORS proxy for the cert server.
+// Deploy at https://workers.cloudflare.com  (free plan, no card needed)
+//
+// หมายเหตุสำคัญ 2 ข้อ:
+// 1) Workers ยิง fetch ไปที่ IP ดิบ ๆ ไม่ได้ (Cloudflare ตอบ error 1003)
+//    จึงต้องใช้ชื่อโดเมน nip.io ที่ชี้กลับไปที่ IP เดิมเป๊ะ ๆ
+// 2) ตัวเว็บ PHP เช็กว่า host ใน Referer ต้องตรงกับ Host ของ request
+//    ถ้าไม่ตรง endpoint toJSON จะตอบ 200 พร้อม body ว่างเปล่า
 
-<h2>ค้นหาเกียรติบัตร</h2>
+const ALLOW_HOSTS = ["110.164.93.228", "110.164.93.228.nip.io"];
+const UPSTREAM_HOST = "110.164.93.228.nip.io";
+const REFERER = "http://" + UPSTREAM_HOST + "/cert/index.php";
 
-<label>ชื่อ-นามสกุล (ไม่ต้องใส่คำนำหน้า)</label>
-<input type="text" id="nameInput" placeholder="เช่น ณภัทร เจือจาน">
+export default {
+  async fetch(request) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors() });
+    }
 
-<label>ช่วงปี พ.ศ.</label>
-<div class="year-inputs">
-  <input type="number" id="yearStart" value="2567">
-  <span>ถึง</span>
-  <input type="number" id="yearEnd" value="2569">
-</div>
+    const self = new URL(request.url);
+    const target = self.searchParams.get("url");
+    if (!target) {
+      const sample = self.origin + "/?url=" + encodeURIComponent("http://110.164.93.228/cert/index.php");
+      return new Response(
+        "cert proxy: OK (worker ทำงานปกติ)\n\n" +
+        "ต้องเรียกพร้อม ?url= เสมอ เช่น:\n" + sample + "\n",
+        { status: 200, headers: { ...cors(), "Content-Type": "text/plain; charset=utf-8" } }
+      );
+    }
 
-<button id="searchBtn">ค้นหา</button>
+    let t;
+    try { t = new URL(target); } catch { return new Response("bad url", { status: 400, headers: cors() }); }
+    if (!ALLOW_HOSTS.includes(t.hostname)) {
+      return new Response("host not allowed", { status: 403, headers: cors() });
+    }
 
-<div id="progressWrap">
-  <div id="progressText">กำลังเริ่มค้นหา...</div>
-  <progress id="progressBar" value="0" max="100"></progress>
-  <div id="liveMatches"></div>
-</div>
+    // เปลี่ยน IP ดิบเป็นชื่อโดเมน เพื่อให้ Workers ยิงออกได้
+    t.hostname = UPSTREAM_HOST;
+    t.protocol = "http:";
+    t.port = "";
 
-<div id="resultsWrap">
-  <h3 id="resultsCount"></h3>
-  <button id="downloadAllBtn" disabled>ดาวน์โหลดทั้งหมด (ZIP)</button>
-  <table id="resultsTable">
-    <thead>
-      <tr><th>ปี</th><th>กิจกรรม</th><th>ชื่อ</th><th></th></tr>
-    </thead>
-    <tbody id="resultsBody"></tbody>
-  </table>
-</div>
-
-<script>
-const BASE_URL = "http://110.164.93.228/cert/index.php";
-const ACTIVITY_LIST_URL = "http://110.164.93.228/cert/index.php/certificate/model/project/toJSON";
-const CONCURRENCY = 16;
-const MATCH_THRESHOLD = 0.95;
-const CORS_PROXY = "https://corsproxy.io/?url=";
-
-const PREFIX_RE = /^(นาย|นาง|นางสาว|น\.ส\.|ด\.ช\.|ด\.ญ\.)\s*/;
-const ZW_RE = /[\u200b\u200c\u200d\ufeff]/g;
-const ACTIVITY_TITLE_RE = /^\[([^\]]+)\]\s*(.*)$/;
-
-function cleanName(s){
-  return (s || "").replace(ZW_RE, "").trim().replace(PREFIX_RE, "").replace(/\s+/g, " ").trim();
-}
-
-function bigrams(s){
-  const clean = s.replace(/\s+/g, "");
-  const out = [];
-  for(let i=0;i<clean.length-1;i++) out.push(clean.slice(i,i+2));
-  return out;
-}
-
-function diceCoefficient(a, b){
-  const A = bigrams(a), B = bigrams(b);
-  if(A.length === 0 || B.length === 0) return a === b ? 1 : 0;
-  const bMap = {};
-  for(const bg of B) bMap[bg] = (bMap[bg] || 0) + 1;
-  let overlap = 0;
-  for(const bg of A){ if(bMap[bg] > 0){ overlap++; bMap[bg]--; } }
-  return (2 * overlap) / (A.length + B.length);
-}
-
-function sanitizeFilename(s){
-  return s.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim().slice(0, 140);
-}
-
-let proxyConfirmedNeeded = false;
-
-async function fetchWithFallback(url, options = {}){
-  if(!proxyConfirmedNeeded){
-    try{
-      const r = await fetch(url, { ...options, mode: "cors" });
-      if(r.ok){
-        const text = await r.text();
-        if(text) return text;
-      }
-    }catch(e){ /* fall through */ }
-    proxyConfirmedNeeded = true;
-  }
-  const r2 = await fetch(CORS_PROXY + encodeURIComponent(url), options);
-  if(!r2.ok) throw new Error("proxy fetch failed: HTTP " + r2.status);
-  return await r2.text();
-}
-
-async function getActivities(year){
-  const url = `${ACTIVITY_LIST_URL}?${Date.now()}`;
-  const html = await fetchWithFallback(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    const headers = new Headers({
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "Referer": REFERER,
       "X-Requested-With": "XMLHttpRequest",
-    },
-    body: `year=${year}`,
-  });
-
-  let payload;
-  try{ payload = JSON.parse(html); }
-  catch(e){ console.warn(`ปี ${year}: ไม่ใช่ JSON`, html.slice(0,200)); return []; }
-
-  const certDict = payload.cert_id || {};
-  const activities = [];
-  for(const [key, value] of Object.entries(certDict)){
-    if(key === "0") continue;
-    const m = ACTIVITY_TITLE_RE.exec(value);
-    if(m) activities.push({ year, certId: key, date: m[1], title: m[2] });
-    else activities.push({ year, certId: key, date: "", title: value });
-  }
-  return activities;
-}
-
-function parseRows(html){
-  const doc = new DOMParser().parseFromString(html, "text/html");
-  const rows = [];
-  doc.querySelectorAll("tr").forEach(tr => {
-    const link = tr.querySelector('a[href*="export.php"]');
-    if(!link) return;
-    const idMatch = link.getAttribute("href").match(/id=(\d+)/);
-    if(!idMatch) return;
-    let nameText = "";
-    tr.querySelectorAll("td").forEach(td => {
-      if(!nameText && /[\u0E00-\u0E7F]/.test(td.textContent)) nameText = td.textContent.trim();
     });
-    if(nameText) rows.push({ name: nameText, printId: idMatch[1] });
-  });
-  return rows;
-}
-
-function extractCertImage(html){
-  const m = html.match(/data:image\/([a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)"/);
-  if(!m) return null;
-  const extRaw = m[1].toLowerCase();
-  const extMap = { jpeg:"jpg", jpg:"jpg", png:"png", webp:"webp", gif:"gif" };
-  const ext = extMap[extRaw] || extRaw;
-  const b64 = m[2].replace(/\s+/g, "");
-  return { dataUri: `data:image/${extRaw};base64,${b64}`, base64: b64, ext };
-}
-
-async function runPool(tasks, worker, concurrency, onProgress){
-  let idx = 0, done = 0;
-  async function next(){
-    while(idx < tasks.length){
-      const myIdx = idx++;
-      try{ await worker(tasks[myIdx]); }catch(e){}
-      done++;
-      if(onProgress) onProgress(done, tasks.length);
+    if (request.method === "POST") {
+      headers.set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
     }
-  }
-  const workers = Array.from({length: Math.min(concurrency, tasks.length)}, next);
-  await Promise.all(workers);
-}
 
-const nameInput = document.getElementById("nameInput");
-const yearStartInput = document.getElementById("yearStart");
-const yearEndInput = document.getElementById("yearEnd");
-const searchBtn = document.getElementById("searchBtn");
-const progressWrap = document.getElementById("progressWrap");
-const progressBar = document.getElementById("progressBar");
-const progressText = document.getElementById("progressText");
-const liveMatchesEl = document.getElementById("liveMatches");
-const resultsWrap = document.getElementById("resultsWrap");
-const resultsCount = document.getElementById("resultsCount");
-const resultsBody = document.getElementById("resultsBody");
-const downloadAllBtn = document.getElementById("downloadAllBtn");
-
-let allMatches = [];
-let searching = false;
-
-nameInput.addEventListener("keydown", (e) => { if(e.key === "Enter") startSearch(); });
-searchBtn.addEventListener("click", startSearch);
-
-async function startSearch(){
-  if(searching) return;
-  const rawName = nameInput.value.trim();
-  if(!rawName){ nameInput.focus(); return; }
-  const targetName = cleanName(rawName);
-  const yearStart = parseInt(yearStartInput.value, 10);
-  const yearEnd = parseInt(yearEndInput.value, 10);
-  if(!yearStart || !yearEnd || yearStart > yearEnd){
-    alert("กรุณาใส่ช่วงปีให้ถูกต้อง");
-    return;
-  }
-
-  searching = true;
-  searchBtn.disabled = true;
-  searchBtn.textContent = "กำลังค้นหา...";
-  allMatches = [];
-  resultsWrap.style.display = "none";
-  resultsBody.innerHTML = "";
-  liveMatchesEl.innerHTML = "";
-  progressWrap.style.display = "block";
-  progressBar.value = 0;
-  progressText.textContent = "กำลังดึงรายชื่อกิจกรรมจริง...";
-
-  const years = [];
-  for(let y = yearStart; y <= yearEnd; y++) years.push(y);
-
-  let allActivities = [];
-  for(const y of years){
-    progressText.textContent = `กำลังดึงรายชื่อกิจกรรมปี ${y}...`;
-    const activities = await getActivities(y);
-    allActivities = allActivities.concat(activities);
-  }
-
-  if(allActivities.length === 0){
-    progressText.textContent = "ไม่พบรายชื่อกิจกรรมเลย (endpoint อาจถูกบล็อกหรือ proxy ล่ม ลองใหม่อีกครั้ง)";
-    searching = false;
-    searchBtn.disabled = false;
-    searchBtn.textContent = "ค้นหา";
-    return;
-  }
-
-  const seenChips = new Set();
-
-  await runPool(allActivities, async (activity) => {
-    const url = `${BASE_URL}?count=100&year=${activity.year}&group_id=0&cert_id=${activity.certId}&sort=user_no&search=`;
-    const html = await fetchWithFallback(url);
-    const rows = parseRows(html);
-    for(const row of rows){
-      const rowName = cleanName(row.name);
-      const score = diceCoefficient(rowName, targetName);
-      if(score >= MATCH_THRESHOLD){
-        allMatches.push({ year: activity.year, activity: activity.title, date: activity.date, name: row.name, printId: row.printId, score });
-        const chipKey = activity.year + "_" + row.printId;
-        if(!seenChips.has(chipKey)){
-          seenChips.add(chipKey);
-          const div = document.createElement("div");
-          div.textContent = `พบ: ${activity.year} - ${activity.title}`;
-          liveMatchesEl.appendChild(div);
-        }
-      }
+    let upstream;
+    try {
+      upstream = await fetch(t.toString(), {
+        method: request.method,
+        headers,
+        body: request.method === "POST" ? await request.text() : undefined,
+        redirect: "follow",
+      });
+    } catch (e) {
+      return new Response("upstream error: " + e.message, { status: 502, headers: cors() });
     }
-  }, CONCURRENCY, (done, total) => {
-    progressBar.value = Math.round((done / total) * 100);
-    progressText.textContent = `กำลังตรวจกิจกรรม... ${done}/${total}`;
-  });
 
-  finishSearch(targetName);
+    const out = new Headers(cors());
+    out.set("Content-Type", upstream.headers.get("Content-Type") || "text/html; charset=utf-8");
+    return new Response(upstream.body, { status: upstream.status, headers: out });
+  },
+};
+
+function cors() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Cache-Control": "no-store",
+  };
 }
-
-function finishSearch(targetName){
-  searching = false;
-  searchBtn.disabled = false;
-  searchBtn.textContent = "ค้นหา";
-  progressText.textContent = "ค้นหาเสร็จสิ้น";
-
-  const byKey = new Map();
-  for(const m of allMatches){
-    const key = m.year + "_" + m.printId;
-    if(!byKey.has(key) || byKey.get(key).score < m.score) byKey.set(key, m);
-  }
-  allMatches = Array.from(byKey.values()).sort((a,b) => a.year - b.year || b.score - a.score);
-
-  resultsWrap.style.display = "block";
-  resultsCount.textContent = `พบ ${allMatches.length} ใบ สำหรับ "${targetName}"`;
-
-  if(allMatches.length === 0){
-    downloadAllBtn.disabled = true;
-    return;
-  }
-  downloadAllBtn.disabled = false;
-  allMatches.forEach((m, i) => renderRow(m, i));
-}
-
-function printLinkFor(match){
-  return `http://110.164.93.228/cert/export.php?module=certificate-export&type=print&id=${match.printId}`;
-}
-
-const imageCache = new Map();
-async function getCertImage(match){
-  const key = match.printId;
-  if(imageCache.has(key)) return imageCache.get(key);
-  try{
-    const html = await fetchWithFallback(printLinkFor(match));
-    const img = extractCertImage(html);
-    imageCache.set(key, img);
-    return img;
-  }catch(e){ return null; }
-}
-
-function renderRow(match, index){
-  const tr = document.createElement("tr");
-  tr.innerHTML = `
-    <td>${match.year}</td>
-    <td>${match.activity}</td>
-    <td>${match.name}</td>
-    <td>
-      <a href="${printLinkFor(match)}" target="_blank">ดู</a>
-      <button data-idx="${index}">โหลด</button>
-    </td>
-  `;
-  resultsBody.appendChild(tr);
-
-  tr.querySelector("button").addEventListener("click", async (e) => {
-    const btn = e.currentTarget;
-    btn.disabled = true;
-    btn.textContent = "...";
-    const img = await getCertImage(match);
-    btn.disabled = false;
-    btn.textContent = "โหลด";
-    if(img) downloadDataUri(img.dataUri, sanitizeFilename(`${match.year}_${match.activity}_${match.printId}`) + "." + img.ext);
-  });
-}
-
-function downloadDataUri(dataUri, filename){
-  const a = document.createElement("a");
-  a.href = dataUri;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-}
-
-downloadAllBtn.addEventListener("click", async () => {
-  downloadAllBtn.disabled = true;
-  const originalText = downloadAllBtn.textContent;
-  const zip = new JSZip();
-  let done = 0;
-
-  for(const match of allMatches){
-    downloadAllBtn.textContent = `กำลังรวมไฟล์... ${done}/${allMatches.length}`;
-    const img = await getCertImage(match);
-    if(img){
-      const filename = sanitizeFilename(`${match.year}_${match.activity}_${match.printId}`) + "." + img.ext;
-      zip.file(filename, img.base64, { base64: true });
-    }
-    done++;
-  }
-
-  downloadAllBtn.textContent = "กำลังสร้าง ZIP...";
-  const blob = await zip.generateAsync({ type: "blob" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "เกียรติบัตร.zip";
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-
-  downloadAllBtn.disabled = false;
-  downloadAllBtn.textContent = originalText;
-});
-</script>
-</body>
-</html>
